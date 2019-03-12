@@ -22,451 +22,64 @@ Porting to Windows will likely require some work, but assumptions about the
 target system were avoided or at least made clear.
 """
 
-import os
 import sys
-import argparse
-import inspect
+import os
+if sys.version_info.major < 3:
+    sys.stderr.write('ERROR: This script requires Python version 3.{}'.format(os.linesep))
+    sys.exit(1)
+
 import collections
 import re
-import hashlib
-import time
-from getpass import getpass
-from html.parser import HTMLParser
-from glob import glob
-from configparser import ConfigParser
 
+from lib import command
 from lib import configuration
-from lib import constants
-from lib import options
+from lib import credentials
+from lib import firewall
+from lib import openvpn
+from lib import pia
 from lib import tools
 
 
-class Argument(object):
-    """Positional/keyword arguments for ArgumentParser.add_argument()."""
+REQUIRED_PACKAGES = [
+    tools.Package('openvpn', executable='openvpn'),
+]
 
-    def __init__(self, *args, **kwargs):
-        self.args = args
-        self.kwargs = kwargs
+COMMAND_DESCRIPTION = 'OpenVPN front-end'
 
+ProviderPaths = collections.namedtuple('Server', [
+    'config_dir', 'state_dir', 'download_dir', 'port_path'
+])
 
-class SubCommand(object):
-    """Base sub-command class."""
 
-    def __init__(self, argument_parser, sub_command_argument_parsers):
-        # Help needs access to CLI argument parsers.
-        self.argument_parser = argument_parser
-        self.sub_command_argument_parsers = sub_command_argument_parsers
-
-    def execute(self):
-        """Required method to execute the sub-command."""
-        raise NotImplementedError
-
-    def invoke_run(self):
-        """Invoke the sub-class run() method."""
-        try:
-            if hasattr(self, 'setup'):
-                self.setup()    #pylint: disable=E1101
-            if hasattr(self, 'execute'):
-                self.execute()  #pylint: disable=E1101
-            if hasattr(self, 'cleanup'):
-                self.cleanup()  #pylint: disable=E1101
-        except BaseException as exc:
-            tools.error(exc, fatal_error=True)
-
-
-class Help(SubCommand):
-    """'help' sub-command class."""
-
-    name = 'help'
-    help = 'display general or command-specific help'
-    arguments = [
-        Argument(
-            dest='HELP_TOPICS', nargs='*',
-            help='topic(s) for specific help'
-        ),
-    ]
-
-    def execute(self):
-        if options.HELP_TOPICS:
-            for topic in options.HELP_TOPICS:
-                if topic in self.sub_command_argument_parsers:
-                    self.sub_command_argument_parsers[topic].print_help()
-                else:
-                    tools.error('Bad help topic: {}'.format(topic))
-        else:
-            self.argument_parser.print_help()
-
-
-def process_commands(sub_command_classes):
-    """Parse arguments and invoke the sub-command."""
-
-    argument_parser = argparse.ArgumentParser(
-        description=constants.COMMAND_DESCRIPTION,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    argument_parser.add_argument(
-        '-v', '--verbose', dest='VERBOSE', action='store_true',
-        help='display extra verbose information')
-
-    argument_parser.add_argument(
-        '-n', '--dry-run', dest='DRYRUN', action='store_true',
-        help='preview actions by performing a dry run')
-
-    sub_command_sub_parsers = argument_parser.add_subparsers(
-        dest='COMMAND',
-        metavar='COMMAND',
-    )
-
-    sub_command_argument_parsers = {}
-
-    for name in sorted(sub_command_classes.keys()):
-        cls = sub_command_classes[name]
-        sub_parser = sub_command_sub_parsers.add_parser(name, help=cls.help)
-        sub_command_argument_parsers[name] = sub_parser
-        if hasattr(cls, 'arguments'):
-            for argument in cls.arguments:
-                sub_command_argument_parsers[name].add_argument(
-                    *argument.args, **argument.kwargs)
-    parsed_args = argument_parser.parse_args()
-    if not parsed_args.COMMAND:
-        argument_parser.print_help()
-        sys.exit(1)
-    for key in parsed_args:
-        setattr(options, key, parsed_args[key])
-    sub_command_class = sub_command_classes[parsed_args.COMMAND]
-    sub_command = sub_command_class(argument_parser, sub_command_argument_parsers)
-    sub_command.invoke_run()
-
-
-def find_command_classes(commands, module):
-    """Populate a command dictionary for a module."""
-    for _name, obj in inspect.getmembers(module):
-        if inspect.isclass(obj) and issubclass(obj, SubCommand):
-            if hasattr(obj, 'name'):
-                commands[obj.name] = obj
-
-
-def save_credentials():
-    """Prompt for and save credentials."""
-    if not options.DRYRUN:
-        try:
-            while True:
-                username = input('Username: ')
-                if username:
-                    break
-                tools.error('Username must not be empty.')
-            while True:
-                password = getpass(prompt='Password: ')
-                if password:
-                    break
-                tools.error('Password must not be empty.')
-        except (EOFError, KeyboardInterrupt):
-            tools.info('', 'Credentials were not saved.')
-            sys.exit(1)
-        with tools.open_output_file(constants.CREDENTIALS_PATH,
-                                    permissions='600',
-                                    mkdir=True) as credentials_file:
-            credentials_file.write_lines(username, password)
-    tools.info('Credentials were saved:', [constants.CREDENTIALS_PATH])
-
-
-def get_credentials():
-    """Return data from the credentials file, creating the file if necessary."""
-    if not os.path.exists(constants.CREDENTIALS_PATH):
-        save_credentials()
-    with tools.open_input_file(constants.CREDENTIALS_PATH) as credentials_file:
-        lines = [line for line in credentials_file.read_lines()]
-        if len(lines) < 2:
-            tools.error('The credentials file is bad.',
-                        'Use the "credentials" sub-command to save a new one.',
-                        fatal_error=True)
-        return lines[:2]
-
-
-########## App-specific code
-
-
-class PortForwardingServerNameScraper(HTMLParser):
-    """Extracts port-forwarding server name list from HTML page URL."""
-
-    def __init__(self):
-        self.content_div_level = None
-        self.content_ul_level = None
-        self.is_found_item = False
-        self.found = None
-        super().__init__()
-
-    def scrape(self):
-        tools.download_file(
-            constants.FORWARDING_HELP_URL,
-            constants.PORT_FORWARDING_HTML_PATH,
-            expiration=constants.PORT_FORWARDING_LIST_EXPIRATION,
-            fatal_error=False,
-        )
-        if os.path.exists(constants.PORT_FORWARDING_HTML_PATH):
-            with tools.open_input_file(constants.PORT_FORWARDING_HTML_PATH) as html_file:
-                self.feed(html_file.read())
-        if self.found:
-            with tools.open_output_file(constants.PORT_FORWARDING_LIST_PATH) as list_file:
-                list_file.write_lines(*self.found)
-
-    def handle_starttag(self, tag, attrs):
-        self.is_found_item = False
-        if self.content_div_level is None:
-            if tag == 'div' and self.found is None:
-                for attr_name, attr_value in attrs:
-                    if attr_name == 'class' and 'article-content' in attr_value.split():
-                        self.content_div_level = 1
-                        break
-            return
-        if tag == 'div':
-            self.content_div_level += 1
-            return
-        if tag == 'ul':
-            if self.content_ul_level is None:
-                self.content_ul_level = 0
-            else:
-                self.content_ul_level += 1
-            return
-        if tag == 'li' and self.content_ul_level == 0:
-            if self.found is None:
-                self.found = []
-            self.found.append('')
-            self.is_found_item = True
-
-    def handle_data(self, data):
-        if self.is_found_item:
-            if data:
-                self.found[-1] = self.found[-1] + data
-
-    def handle_endtag(self, tag):
-        if self.content_div_level is not None and tag == 'div':
-            self.content_div_level -= 1
-            if self.content_div_level == 0:
-                self.content_div_level = None
-                self.content_ul_level = None
-        if self.content_ul_level is not None and tag == 'ul':
-            self.content_ul_level -= 1
-
-class Dumpable:
-    """Dumpable overrides __str__ and __repr__ for useful stringized output."""
-    def __str__(self):
-        attr_pairs = []
-        for name, member in inspect.getmembers(self):
-            if not name.startswith('_'):
-                value_string = "'{}'".format(member) if isinstance(member, str) else str(member)
-                attr_pairs.append((name, value_string))
-        attrs_string = ', '.join(['{}={}'.format(key, value) for key, value in attr_pairs])
-        return '{}({})'.format(self.__class__.__name__, attrs_string)
-    def __repr__(self):
-        return str(self)
-
-
-class OpenVPNServer(Dumpable):
-    """An OpenVPN server configuration."""
-
-    def __init__(self, name, config_path, protocol, port_forwarding, recent_order):
-        self.name = name
-        self.config_path = config_path
-        self.protocols = [protocol]
-        self.port_forwarding = port_forwarding
-        self.recent_order = recent_order
-        self.latency = constants.BIG_NUMBER
-
-    @property
-    def remote(self):
-        if not hasattr(self, '_remote'):
-            class Remote:
-                def __init__(self, address, port):
-                    self.addr = address
-                    self.port = port
-            with tools.open_input_file(self.config_path) as config_file:
-                for line in config_file.read_lines():
-                    fields = line.strip().split()
-                    if fields[0] == 'remote':
-                        try:
-                            self._remote = Remote(fields[1], int(fields[2]))
-                            break
-                        except (IndexError, ValueError):
-                            tools.error('Unable to read or parse OpenVPN configuration:',
-                                        [self.config_path],
-                                        fatal_error=True)
-                else:
-                    tools.error('OpenVPN configuration is missing "remote" line:',
-                                [self.config_path], fatal_error=True)
-        return self._remote
-
-
-class OpenVPNConfigurationBundle:
-    """Web/filesystem data for a downloaded server configuration bundle."""
-
-    Server = collections.namedtuple('Server', ['name', 'path', 'protocol', 'forwarding'])
-
-    def __init__(self, protocol, port_forwarding_names):
-        self.protocol = protocol if protocol is not None else options.PROTOCOL
-        self.port_forwarding_names = port_forwarding_names or []
-        if self.protocol not in constants.PROTOCOLS:
-            tools.error('Bad protocol: {}'.format(protocol), fatal_error=True)
-        file_name = constants.PROTOCOL_ZIP_FILES[self.protocol]
-        self.download_path = os.path.join(constants.DOWNLOADS_DIRECTORY, file_name)
-        self.download_url = '/'.join([constants.DOWNLOAD_URL, file_name])
-        self.directory = os.path.join(constants.CONFIGURATION_DIRECTORY, protocol)
-
-    def install_configuration_files(self, force=False):
-        """Download and install configuration."""
-        downloaded = tools.download_file(self.download_url, self.download_path, force=force)
-        if not downloaded and not force and self.servers:
-            return False
-        tools.unzip_to(self.download_path, self.directory)
-        return True
-
-    @property
-    def servers(self):
-        """On-demand/cached server list."""
-        if not hasattr(self, '_servers'):
-            self._servers = []
-            for path in sorted(glob(os.path.join(self.directory, '*.ovpn'))):
-                name = os.path.splitext(os.path.basename(path))[0]
-                forwarding = (name in self.port_forwarding_names)
-                self._servers.append(self.Server(name, path, self.protocol, forwarding))
-        return self._servers
-
-
-class OptionSet(Dumpable):
-    """A user-specified server configuration."""
-    def __init__(self, servers, option_data):
-        self.servers = servers
-        for key, value in option_data.items():
-            setattr(self, key, value)
-
-
-class Firewall:
-    """Firewall management."""
-
-    # Private implementation methods to hide ugly iptables CLI.
-
-    @classmethod
-    def _iptables_run(cls, *args):
-        tools.run_command('sudo', 'iptables', *args)
-
-    @classmethod
-    def _iptables_reset_input(cls):
-        cls._iptables_run('--policy', 'INPUT', 'ACCEPT')
-
-    @classmethod
-    def _iptables_reset_output(cls):
-        cls._iptables_run('--policy', 'OUTPUT', 'ACCEPT')
-
-    @classmethod
-    def _iptables_reset_forwarding(cls):
-        cls._iptables_run('--policy', 'FORWARD', 'ACCEPT')
-
-    @classmethod
-    def _iptables_enable_input_device(cls, device):
-        cls._iptables_run('-A', 'INPUT', '-i', device, '-j', 'ACCEPT')
-
-    @classmethod
-    def _iptables_enable_output_device(cls, device):
-        cls._iptables_run('-A', 'OUTPUT', '-o', device, '-j', 'ACCEPT')
-
-    @classmethod
-    def _iptables_accept_forwarding(cls):
-        cls._iptables_run('-A', 'FORWARD', '-j', 'ACCEPT')
-
-    @classmethod
-    def _iptables_enable_input_address(cls, device, address):
-        cls._iptables_run('-A', 'INPUT', '-i', device, '-s', address, '-j', 'ACCEPT')
-
-    @classmethod
-    def _iptables_enable_output_address(cls, device, address):
-        cls._iptables_run('-A', 'OUTPUT', '-o', device, '-d', address, '-j', 'ACCEPT')
-
-    @classmethod
-    def _iptables_enable_input_protocol(cls, device, protocol, port):
-        cls._iptables_run('-A', 'INPUT', '-o', device,
-                         '-p', protocol, '--dport', port, '-j', 'ACCEPT')
-
-    @classmethod
-    def _iptables_enable_output_protocol(cls, device, protocol, address, port):
-        cls._iptables_run('-A', 'OUTPUT', '-o', device, '-d', address,
-                         '-p', protocol, '--dport', port, '-j', 'ACCEPT')
-
-    @classmethod
-    def _iptables_enable_input_states(cls, *states):
-        state_string = ','.join(states)
-        cls._iptables_run('-A', 'INPUT', '-m', 'state', '--state', state_string, '-j', 'ACCEPT')
-
-    @classmethod
-    def _iptables_disable_input(cls):
-        cls._iptables_run('--policy', 'INPUT', 'DROP')
-
-    @classmethod
-    def _iptables_disable_output(cls):
-        cls._iptables_run('--policy', 'OUTPUT', 'DROP')
-
-    @classmethod
-    def _iptables_disable_forwarding(cls):
-        cls._iptables_run('--policy', 'FORWARD', 'DROP')
-
-    @classmethod
-    def _iptables_clear_all(cls):
-        cls._iptables_run('-Z')
-        cls._iptables_run('-F')
-        cls._iptables_run('-X')
-
-    # Public methods.
-
-    @classmethod
-    def reset(cls):
-        """Reset the firewall."""
-        cls._iptables_reset_input()
-        cls._iptables_reset_output()
-        cls._iptables_reset_forwarding()
-        cls._iptables_clear_all()
-
-    @classmethod
-    def start(cls, def_dev, vpn_dev, lan_addr, port, protocol):
-        """Start the firewall."""
-        cls._iptables_disable_output()
-        cls._iptables_disable_input()
-        cls._iptables_disable_forwarding()
-        cls._iptables_enable_output_device('lo')
-        cls._iptables_enable_output_device(vpn_dev)
-        cls._iptables_enable_output_protocol(def_dev, protocol, lan_addr, port)
-        cls._iptables_enable_input_device('lo')
-        cls._iptables_enable_input_states('ESTABLISHED', 'RELATED')
-
-    @classmethod
-    def forward_port(cls, device, port):
-        """Forward a port."""
-        cls._iptables_enable_input_protocol(device, 'tcp', port)
-        cls._iptables_enable_input_protocol(device, 'udp', port)
-
-    @classmethod
-    def enable_lan(cls, device, address):
-        """Enable LAN access."""
-        cls._iptables_enable_output_address(device, address)
-        cls._iptables_enable_input_address(device, address)
-
-
-class PIASubCommand(SubCommand):
-    """VPN-related sub-command base class."""
+class ProviderSubCommand(command.SubCommand):
+    """Base class for VPN provider-related sub-commands."""
 
     vpn_device_regex = re.compile(r'TUN/TAP device (\w+) opened')
     iproute_show_regex = re.compile(r'^default via ([0-9.]+) dev (\w+) ')
     vpn_config_remote_regex = re.compile(r'^\s*remote ([^\s]+) (\d+)\s*$')
     vpn_config_protocol_regex = re.compile(r'^\s*proto (\w+)\s*$')
 
-    class Error(BaseException):
-        """Exception raised for VPN-related errors."""
-        pass
-
     def __init__(self, argument_parser, sub_command_argument_parsers):
+        #TODO: Support other non-PIA providers.
+        provider_cls = pia.PIAProvider
+        self.base_dir = tools.create_directory('~', '.{}'.format(provider_cls.short_name))
+        self.config_dir = tools.create_directory(self.base_dir, 'configuration')
+        self.state_dir = tools.create_directory(self.base_dir, 'state')
+        self.download_dir = tools.create_directory(self.base_dir, 'downloads')
+        self.config_path = os.path.join(self.config_dir, '{}.conf'.format(provider_cls.short_name))
+        self.cred_path = os.path.join(self.config_dir, '{}.cred'.format(provider_cls.short_name))
+        self.port_path = os.path.join(self.state_dir, '{}.port'.format(provider_cls.short_name))
+        self.state_path = os.path.join(self.state_dir, '{}.state.json'.format(provider_cls.short_name))
+        self.pid_path = os.path.join(self.state_dir, '{}.pid'.format(provider_cls.short_name))
+        self.log_path = os.path.join(self.state_dir, '{}.log'.format(provider_cls.short_name))
+        self.provider = provider_cls(ProviderPaths(
+            self.config_dir,
+            self.state_dir,
+            self.download_dir,
+            self.port_path,
+        ))
         # Data loaded (lazily) from the user configuration file.
-        self.raw_option_sets = None
-        self.default_config = None
-        self.saved_state = tools.PersistentJSONData(constants.STATE_PATH, 'state')
+        self.saved_state = tools.PersistentJSONData(self.state_path, 'state')
         super().__init__(argument_parser, sub_command_argument_parsers)
 
     def cleanup(self):
@@ -474,155 +87,53 @@ class PIASubCommand(SubCommand):
         self.saved_state.save()
 
     @property
-    def port_forwarding_server_names(self):
-        """Get scraped or fall-back port-forwarding server name list."""
-        if not hasattr(self, '_port_forwarding_server_names'):
-            scraper = PortForwardingServerNameScraper()
-            scraper.scrape()
-            port_forwarding_server_names = None
-            if os.path.exists(constants.PORT_FORWARDING_LIST_PATH):
-                with tools.open_input_file(constants.PORT_FORWARDING_LIST_PATH) as list_file:
-                    port_forwarding_server_names = list(list_file.read_lines())
-            if not port_forwarding_server_names:
-                tools.warning('Using fall-back port-forwarding server name list.')
-                port_forwarding_server_names = constants.PROVISIONAL_PORT_FORWARDING_SERVER_LIST
-            self._port_forwarding_server_names = port_forwarding_server_names
-        return self._port_forwarding_server_names
-
-    @property
     def openvpn_servers(self):
         """Provide and manage cached OpenVPN server list."""
         if not hasattr(self, '_openvpn_servers'):
-            recent = self.saved_state.data.recent_servers or [] #pylint: disable=E1101
-            servers = {}
-            for openvpn_protocol_bundle in self.iterate_openvpn_bundles():
-                for server in openvpn_protocol_bundle.servers:
-                    if server.name not in servers:
-                        if server.name in recent:
-                            recent_order = recent.index(server.name) + 1
-                        else:
-                            recent_order = constants.BIG_NUMBER
-                        servers[server.name] = OpenVPNServer(
-                            server.name,
-                            server.path,
-                            server.protocol,
-                            server.forwarding,
-                            recent_order,
-                        )
-                    else:
-                        servers[server.name].protocols.append(server.protocol)
-            if not servers:
-                raise self.Error(
-                    'OpenVPN files not found.',
-                    'You may need to run the "install" command.'
-                )
-            self._openvpn_servers = sorted(servers.values(), key=lambda server: server.name)
+            self._openvpn_servers = self.provider.get_servers()
         return self._openvpn_servers
 
-    def iterate_openvpn_bundles(self):
-        """Generate OpenVPN configuration data for all supported protocols."""
-        for protocol in constants.PROTOCOLS:
-            yield OpenVPNConfigurationBundle(protocol, self.port_forwarding_server_names)
+    @property
+    def config(self):
+        """On-demand access to user configuration data."""
+        if not hasattr('_config'):
+            self._config = configuration.Data(self.config_path, self.openvpn_servers)
+            self._config.load()
+        return self._config
 
-    def _load_user_configuration_file(self, config=None):
-        """Read and parse the user configuration file."""
-        self.raw_option_sets = {}
-        user_config = ConfigParser()
-        with tools.open_input_file(constants.CONFIGURATION_PATH) as config_file:
-            user_config.read_file(config_file)
-            for section in user_config.sections():
-                if self.default_config is None:
-                    self.default_config = section
-                self.raw_option_sets[section] = user_config[section]
-        if not self.raw_option_sets or not self.default_config:
-            tools.error('No option sets found in file:',
-                        [constants.CONFIGURATION_PATH],
-                        fatal_error=True)
+    @property
+    def credentials(self):
+        """On-demand access to user credentials."""
+        if not hasattr('_credentials'):
+            self._credentials = credentials.Credentials(self.cred_path)
+        return self._credentials
 
-    def get_option_set(self, name=None):
-        """Return named or default configuration option set."""
-        if self.raw_option_sets is None:
-            self._load_user_configuration_file()
-        name = name or self.default_config
-        if name not in self.raw_option_sets:
-            tools.error('Option set not found: {}'.format(name), fatal_error=True)
-        raw_option_set = self.raw_option_sets[name]
-        servers_string = raw_option_set.get('servers', None)
-        if servers_string:
-            server_patterns = [pat.strip() for pat in servers_string.split(',')]
-        else:
-            server_patterns = []
-        matched_server_names = set()
-        matching_openvpn_servers = []
-        for pattern in server_patterns:
-            regex_pattern = r'^{}$'.format(pattern.replace('*', '.*'))
-            server_matcher = re.compile(regex_pattern, re.IGNORECASE)
-            for openvpn_server in self.openvpn_servers:
-                if server_matcher.match(openvpn_server.name):
-                    if openvpn_server.name not in matched_server_names:
-                        matched_server_names.add(openvpn_server.name)
-                        matching_openvpn_servers.append(openvpn_server)
-        if not matching_openvpn_servers:
-            tools.warning('No matching servers for pattern.')
-        option_data = configuration.Meta.check_data(raw_option_set)
-        return OptionSet(matching_openvpn_servers, option_data)
-
-    def select_servers(self, option_set):
+    def select_servers(self, server_config):
         """Select a server based on options, selection method, and persistent state."""
         # Create the server sequence based on the selected discipline.
-        discipline = (option_set.discipline or 'first').lower()
+        discipline = (server_config.discipline or 'first').lower()
         if discipline == 'first':
-            servers = option_set.servers
+            servers = server_config.servers
         elif discipline == 'fastest':
             for server in servers:
                 server.latency = tools.test_server_latency(server.remote.addr)
-            servers = sorted(option_set.servers,
+            servers = sorted(server_config.servers,
                              key=lambda server: server.latency)
         elif discipline == 'recent':
-            servers = sorted(option_set.servers,
+            servers = sorted(server_config.servers,
                              key=lambda server: server.recent_order)
         elif discipline == 'rotation':
-            servers = sorted(option_set.servers,
+            servers = sorted(server_config.servers,
                              key=lambda server: server.recent_order,
                              reverse=True)
         else:
             tools.error('Bad server selection discipline: {}'.format(discipline), fatal_error=True)
         # Filter based on port forwarding, or not.
-        if option_set.port_forwarding:
+        if server_config.port_forwarding:
             servers = list(filter(lambda server: server.port_forwarding, servers))
         return servers or None
 
-    def get_forwarded_port(self, new_port=False):
-        """Forward a port, if connected, and return the port number."""
-        if options.DRYRUN:
-            return 9999
-        time.sleep(2)
-        # Load or generate the client ID hash for the request parameter.
-        if os.path.exists(constants.CLIENT_ID_FILE_PATH) and not new_port:
-            with tools.open_input_file(constants.CLIENT_ID_FILE_PATH) as id_file:
-                client_id = id_file.read().strip()
-        else:
-            client_id = hashlib.sha256(os.urandom(16384)).hexdigest()
-            with tools.open_output_file(constants.CLIENT_ID_FILE_PATH, mkdir=True) as id_file:
-                id_file.write(client_id)
-        full_url = '/'.join([constants.FORWARDING_REQUEST_URL, '?client_id={}'.format(client_id)])
-        json_response = tools.download_json(full_url, timeout=4)
-        if json_response:
-            try:
-                port = int(json_response.get('port'))
-            except ValueError:
-                tools.error('Invalid returned port value "{}".'.format(port))
-            if port:
-                with tools.open_output_file(constants.PORT_FILE_PATH) as port_file:
-                    port_file.write(str(port))
-                tools.info('Forwarded port ({}) saved to file:'.format(port),
-                                [constants.PORT_FILE_PATH])
-                return port
-        else:
-            tools.error('Failed to establish port forwarding.')
-
-    @classmethod
-    def get_vpn_data(cls, vpn_config_path):
+    def get_vpn_data(self, vpn_config_path):
         """Parse OpenVPN configuration file and return select data."""
         class VPNConfigData:
             def __init__(self):
@@ -635,16 +146,16 @@ class PIASubCommand(SubCommand):
         data = VPNConfigData()
         proc = tools.capture_command('ip', 'route', 'show', always_run=True)
         for line in proc.stdout.split(os.linesep):
-            matched = cls.iproute_show_regex.search(line)
+            matched = self.iproute_show_regex.search(line)
             if matched:
                 data.lan_addr = matched.group(1)
                 data.def_dev = matched.group(2)
                 break
         else:
             tools.error('Failed to find default device using "ip route show".', fatal_error=True)
-        proc = tools.capture_command('sudo', 'cat', constants.LOG_FILE_PATH, always_run=True)
+        proc = tools.capture_command('sudo', 'cat', self.log_path, always_run=True)
         for line in proc.stdout.split(os.linesep):
-            matched = cls.vpn_device_regex.search(line)
+            matched = self.vpn_device_regex.search(line)
             if matched:
                 data.vpn_dev = matched.group(1)
                 break
@@ -652,70 +163,66 @@ class PIASubCommand(SubCommand):
             tools.error('Failed to find TUN/TAP device in log.', fatal_error=True)
         with tools.open_input_file(vpn_config_path) as vpn_config_file:
             for line in vpn_config_file:
-                matched = cls.vpn_config_remote_regex.match(line)
+                matched = self.vpn_config_remote_regex.match(line)
                 if matched:
                     data.addr = matched.group(1)
                     data.port = matched.group(2)
-                matched = cls.vpn_config_protocol_regex.match(line)
+                matched = self.vpn_config_protocol_regex.match(line)
                 if matched:
                     data.protocol = matched.group(1)
         return data
 
-    def start_firewall(self, server, option_set):
-        """Start the PIA-aware firewall."""
-        if not option_set.disable_firewall:
-            vpn = self.get_vpn_data(server.config_path)
+    def start_firewall(self, config_path,
+                       port_forwarding=False,
+                       block_lan=False,
+                       disable_firewall=False):
+        """Start the VPN-tweaked firewall."""
+        if not disable_firewall:
+            vpn = self.get_vpn_data(config_path)
             tools.info('Resetting the firewall ...')
-            Firewall.reset()
+            firewall.reset()
             tools.info('Starting the firewall ...')
-            Firewall.start(vpn.def_dev, vpn.vpn_dev, vpn.lan_addr, vpn.port, vpn.protocol)
-            if server.port_forwarding:
-                new_string = ' (new)' if options.NEW_PORT else ''
+            firewall.start(vpn.def_dev, vpn.vpn_dev, vpn.lan_addr, vpn.port, vpn.protocol)
+            if port_forwarding:
+                new_string = ' (new)' if self.options.NEW_PORT else ''
                 tools.info('Determining{} forwarded port ...'.format(new_string))
-                forwarded_port = self.get_forwarded_port(new_port=options.NEW_PORT)
+                forwarded_port = self.provider.get_forwarded_port(new_port=self.options.NEW_PORT)
                 tools.info('Forwarding port {}...'.format(forwarded_port))
-                Firewall.forward_port(vpn.vpn_dev, forwarded_port)
-            if not option_set.block_lan:
+                firewall.forward_port(vpn.vpn_dev, forwarded_port)
+            if not block_lan:
                 tools.info('Enabling LAN address {} on {} ...'.format(vpn.def_dev, vpn.lan_addr))
-                Firewall.enable_lan(vpn.def_dev, vpn.lan_addr)
+                firewall.enable_lan(vpn.def_dev, vpn.lan_addr)
             tools.info('Firewall enabled.')
 
 
-class Install(PIASubCommand):
+class Install(ProviderSubCommand):
     name = 'install'
     help = 'install PIA/OpenVPN prerequisites and configurations'
     arguments = [
-        Argument(
+        command.Argument(
             '-r', '--refresh-openvpn-files', dest='REFRESH_OPENVPN_FILES',
             action='store_true', help='force OpenVPN configuration file refresh'
         ),
-        Argument(
+        command.Argument(
             '-c', '--create-user-config', dest='CREATE_USER_CONFIG', action='store_true',
             help='create new configuration file, even if one exists'
         ),
-        Argument(
+        command.Argument(
             '-u', '--user-only', dest='USER_ONLY', action='store_true',
             help='only update the user configuration'
         ),
     ]
     def execute(self):
         num_actions = 0
-        for dir_path in (
-            constants.BASE_DIRECTORY,
-            constants.DOWNLOADS_DIRECTORY,
-            constants.CONFIGURATION_DIRECTORY,
-            constants.STATE_DIRECTORY):
-            if tools.create_directory(dir_path):
-                num_actions += 1
-        if not options.USER_ONLY:
-            num_actions += tools.install_packages(constants.SYSTEM_PACKAGES)
-        for bundle in self.iterate_openvpn_bundles():
-            num_actions += bundle.install_configuration_files(force=options.REFRESH_OPENVPN_FILES)
-        if not os.path.exists(constants.CREDENTIALS_PATH):
-            save_credentials()
+        if not self.options.USER_ONLY:
+            num_actions += tools.install_packages(REQUIRED_PACKAGES)
+        num_actions += self.provider.install_configuration_files(
+            force=self.options.REFRESH_OPENVPN_FILES)
+        if not os.path.exists(self.cred_path):
+            self.credentials.create()
             num_actions += 1
-        if not os.path.exists(constants.CONFIGURATION_PATH) or options.CREATE_USER_CONFIG:
-            configuration.generate_configuration()
+        if not os.path.exists(self.config_path) or self.options.CREATE_USER_CONFIG:
+            self.config.generate()
             num_actions += 1
         if num_actions > 0:
             tools.info('Installation actions performed: {}'.format(num_actions))
@@ -723,7 +230,7 @@ class Install(PIASubCommand):
             tools.info('No installation actions were needed.')
 
 
-class Servers(PIASubCommand):
+class Servers(ProviderSubCommand):
     name = 'servers'
     help = 'list available servers'
     arguments = []
@@ -738,93 +245,98 @@ class Servers(PIASubCommand):
         tools.display_table(server_rows, header=header, title='Available servers')
 
 
-class Start(PIASubCommand):
+class Start(ProviderSubCommand):
     name = 'start'
     help = 'start the PIA/OpenVPN connection'
     arguments = [
-        Argument(
+        command.Argument(
             '-w', '--wait', dest='WAIT',
             help='do not exit and wait for key to disconnect'
         ),
-        Argument(
+        command.Argument(
             '-N', '--new-port', dest='NEW_PORT',
             help='assign new forwarded port using new client ID'
         ),
-        Argument(
-            '-s', '--option-set', dest='OPTION_SET', action='store',
-            help='option set name to use instead of default'
+        command.Argument(
+            '-s', '--server-config', dest='SERVER_CONFIG', action='store',
+            help='server configuration name to use instead of default'
         ),
     ]
     def execute(self):
         # Make sure credentials are available
-        _credentials = get_credentials()
-        option_set = self.get_option_set(name=options.OPTION_SET)
-        pid = tools.get_running_pid(pid_file=constants.PID_FILE_PATH)
+        self.credentials.get()
+        server_config = self.config.get_server(name=self.options.SERVER_CONFIG)
+        pid = tools.get_running_pid(pid_path=self.pid_path)
         if pid:
             tools.error('OpenVPN server is already running.', fatal_error=True)
-        if options.VERBOSE:
-            tools.info2(option_set)
-        servers = self.select_servers(option_set)
+        if self.options.VERBOSE:
+            tools.info2(server_config)
+        servers = self.select_servers(server_config)
         if not servers:
             tools.error('No matching servers found.', fatal_error=True)
-        if options.VERBOSE:
+        if self.options.VERBOSE:
             tools.info2(servers)
-        tools.delete_file(constants.PID_FILE_PATH, constants.PORT_FILE_PATH)
+        tools.delete_file(self.pid_path, self.port_path)
         for server in servers:
             tools.info('Connecting to: {}'.format(server.name))
             cmd_args = ['sudo', 'openvpn']
-            if not options.WAIT:
-                cmd_args.extend(['--daemon', '--log', constants.LOG_FILE_PATH])
+            if not self.options.WAIT:
+                cmd_args.extend(['--daemon', '--log', self.log_path])
             cmd_args.extend(['--config', server.config_path])
             # --auth-user-pass option must follow --config in order to override.
-            cmd_args.extend(['--auth-user-pass', constants.CREDENTIALS_PATH])
-            if not options.WAIT:
-                cmd_args.extend(['--writepid', constants.PID_FILE_PATH])
+            cmd_args.extend(['--auth-user-pass', self.cred_path])
+            if not self.options.WAIT:
+                cmd_args.extend(['--writepid', self.pid_path])
             if self.saved_state.data.recent_servers:
                 self.saved_state.data.recent_servers.append(server.name)
             else:
                 self.saved_state.data.recent_servers = [server.name]
             proc = tools.run_command(*cmd_args)
             if proc.returncode == 0:
-                if not options.WAIT:
-                    if options.DRYRUN:
+                if not self.options.WAIT:
+                    if self.options.DRYRUN:
                         pid = -1
                     else:
-                        pid = tools.get_running_pid(pid_file=constants.PID_FILE_PATH)
+                        pid = tools.get_running_pid(pid_path=self.pid_path)
                     if pid:
                         tools.info('OpenVPN daemon is running with PID: {}'.format(pid))
-                        self.start_firewall(server, option_set)
+                        self.start_firewall(
+                            server.config_path,
+                            port_forwarding=server.port_forwarding,
+                            block_lan=server_config.block_lan,                 #pylint: disable=no-member
+                            disable_firewall=server_config.disable_firewall,   #pylint: disable=no-member
+                        )
                         break
                     tools.error('OpenVPN does not seem to be running.')
         else:
-            if not options.WAIT and os.path.exists(constants.LOG_FILE_PATH):
+            if not self.options.WAIT and os.path.exists(self.log_path):
                 sys.stderr.write('===== {} (begin) ====={}'.format(
-                    constants.LOG_FILE_PATH, os.linesep))
-                os.system('sudo cat "{}"'.format(constants.LOG_FILE_PATH))
+                    self.log_path, os.linesep))
+                os.system('sudo cat "{}"'.format(self.log_path))
                 sys.stderr.write('===== {} (end) ====={}'.format(
-                    constants.LOG_FILE_PATH, os.linesep))
+                    self.log_path, os.linesep))
             tools.error('Failed to start PIA OpenVPN server.', fatal_error=True)
 
 
-class Stop(PIASubCommand):
+class Stop(ProviderSubCommand):
     name = 'stop'
     help = 'stop the PIA/OpenVPN connection'
     arguments = []
     def execute(self):
-        pid = tools.get_running_pid(pid_file=constants.PID_FILE_PATH)
+        pid = tools.get_running_pid(pid_path=self.pid_path)
         if not pid:
             tools.error('OpenVPN server does not appear to be running.', fatal_error=True)
         tools.info('Killing OpenVPN server PID: {}'.format(pid))
         tools.run_command('sudo', 'kill', pid)
-        tools.delete_file(constants.PID_FILE_PATH, constants.PORT_FILE_PATH)
+        tools.delete_file(self.pid_path, self.port_path)
 
 
-class Status(PIASubCommand):
+class Status(ProviderSubCommand):
     name = 'status'
     help = 'display connection status'
     arguments = []
     def execute(self):
-        pid = tools.get_running_pid(pid_file=constants.PID_FILE_PATH)
+        pid = tools.get_running_pid(pid_path=self.pid_path)
         def _path(path):
             path2 = tools.shorten_path(path)
             if not os.path.exists(path):
@@ -833,54 +345,46 @@ class Status(PIASubCommand):
         tools.display_table([
             ['Server status', 'running' if pid else 'not running'],
             ['Process ID', str(pid) if pid is not None else '-'],
-            ['Base directory', _path(constants.BASE_DIRECTORY)],
-            ['Configuration directory', _path(constants.CONFIGURATION_DIRECTORY)],
-            ['Downloads directory', _path(constants.DOWNLOADS_DIRECTORY)],
-            ['State directory', _path(constants.STATE_DIRECTORY)],
-            ['Configuration file', _path(constants.CONFIGURATION_PATH)],
-            ['Credentials file', _path(constants.CREDENTIALS_PATH)],
-            ['Log file', _path(constants.LOG_FILE_PATH)],
-            ['State file', _path(constants.STATE_PATH)],
-            ['Process PID file', _path(constants.PID_FILE_PATH)],
-            ['Forwarded port file', _path(constants.PORT_FILE_PATH)],
-            ['Client ID file', _path(constants.CLIENT_ID_FILE_PATH)],
-        ], header=['Description', 'Data'])
+            ['Base directory', _path(self.base_dir)],
+            ['Configuration directory', _path(self.config_dir)],
+            ['Downloads directory', _path(self.download_dir)],
+            ['State directory', _path(self.state_dir)],
+            ['Configuration file', _path(self.config_path)],
+            ['Credentials file', _path(self.cred_path)],
+            ['Log file', _path(self.log_path)],
+            ['State file', _path(self.state_path)],
+            ['Process PID file', _path(self.pid_path)],
+            ['Forwarded port file', _path(self.port_path)],
+        ] + [[label, _path(path)] for label, path in self.provider.iterate_status_paths()],
+        header=['Description', 'Data'])
 
 
-class Credentials(PIASubCommand):
+class Credentials(ProviderSubCommand):
     name = 'credentials'
     help = 'save PIA/OpenVPN user credentials'
     arguments = [
-        Argument('-f', '--force', dest='FORCE', action='store_true',
+        command.Argument('-f', '--force', dest='FORCE', action='store_true',
                  help='force by overwriting existing file as needed'),
     ]
     def execute(self):
-        if os.path.exists(constants.CREDENTIALS_PATH) and not options.FORCE:
-            tools.info('Credentials file exists:', [constants.CREDENTIALS_PATH])
+        if os.path.exists(self.cred_path) and not self.options.FORCE:
+            tools.info('Credentials file exists:', [self.cred_path])
             return
-        save_credentials()
+        self.credentials.create()
 
 
-class Log(PIASubCommand):
+class Log(ProviderSubCommand):
     name = 'log'
     help = 'follow PIA/OpenVPN log output'
     def execute(self):
-        pid = tools.get_running_pid(pid_file=constants.PID_FILE_PATH)
+        pid = tools.get_running_pid(pid_path=self.pid_path)
         if pid:
-            os.execvp('sudo', ['sudo', 'tail', '-f', constants.LOG_FILE_PATH])
+            os.execvp('sudo', ['sudo', 'tail', '-f', self.log_path])
         tools.error('OpenVPN does not seem to be running.')
-
-
-def main():
-    """Main function."""
-    # Find all the sub-command subclasses in this module.
-    sub_command_classes = {}
-    find_command_classes(sub_command_classes, sys.modules[__name__])
-    process_commands(sub_command_classes)
 
 
 if __name__ == '__main__':
     try:
-        main()
+        command.main(COMMAND_DESCRIPTION)
     except KeyboardInterrupt:
         sys.exit(2)

@@ -8,16 +8,25 @@ import urllib
 import time
 import json
 import zipfile
+import inspect
 from contextlib import contextmanager
 
-from . import constants
-from . import options
+IS_UNIX_LIKE_PLATFORM = sys.platform in ['linux', 'darwin']
+UNIX_ROOT_BIN_DIRECTORIES = ['/sbin', '/usr/sbin', '/usr/local/sbin', '/opt/sbin']
+FORWARDING_REQUEST_USER_AGENT_STRING = ' '.join([
+    'Mozilla/5.0',
+    '(Macintosh; Intel Mac OS X 10_10_1)',
+    'AppleWebKit/537.36 (KHTML, like Gecko)',
+    'Chrome/39.0.2171.95 Safari/537.36',
+])
+DRYRUN = False
+VERBOSE = False
 
 
 def get_terminal_attribute_symbols():
     '''Provide symbols for terminal colors and visual attributes.'''
     terminal_attribute_symbols = {}
-    if constants.IS_UNIX_LIKE_PLATFORM:
+    if IS_UNIX_LIKE_PLATFORM:
         # Use tput on Unix-like systems to query display strings.
         def _get_tput_string(*tput_args):
             proc = subprocess.run(
@@ -168,8 +177,8 @@ def find_executable(exe_name, as_superuser=False):
     # For a dry run add some additional root-accessible paths to be able to
     # guess whether or not the command would be found as root.
     path = os.environ['PATH']
-    if constants.IS_UNIX_LIKE_PLATFORM and as_superuser and os.getuid() != 0:
-        path = os.path.pathsep.join([path] + constants.UNIX_ROOT_BIN_DIRECTORIES)
+    if IS_UNIX_LIKE_PLATFORM and as_superuser and os.getuid() != 0:
+        path = os.path.pathsep.join([path] + UNIX_ROOT_BIN_DIRECTORIES)
     return find_file_in_path(exe_name, path, executable=True)
 
 
@@ -245,7 +254,7 @@ def info(*line_objs):
 
 def info2(*line_objs):
     """info2 stream wrapper handles VERBOSE-only enabling."""
-    if options.VERBOSE:
+    if VERBOSE:
         INFO2_STREAM(*line_objs)
 
 
@@ -257,7 +266,7 @@ def heading(*line_objs):
 def run_command(*args, **kwargs):
     """Simplified interface to subprocess.run() for non-shell command."""
     fatal_error = kwargs.pop('fatal_error', False)
-    dry_run = options.DRYRUN and not kwargs.pop('always_run', False)
+    dry_run = DRYRUN and not kwargs.pop('always_run', False)
     # String-ize the positional arguments
     subprocess_args = [str(arg) for arg in args]
     # May be called before TOOLS is set up.
@@ -267,7 +276,7 @@ def run_command(*args, **kwargs):
         if kwargs.get('stdout') == subprocess.PIPE:
             proc.stdout = ''
         return proc
-    if options.VERBOSE:
+    if VERBOSE:
         info2('Command: {}'.format(subprocess.list2cmdline(subprocess_args)))
     proc = subprocess.run(subprocess_args, **kwargs)
     if fatal_error and proc.returncode != 0:
@@ -289,6 +298,13 @@ def shell_command(*args, **kwargs):
     return run_command(*args, **kwargs)
 
 
+class Package:
+    """Installable package."""
+    def __init__(self, package, executable=None):
+        self.package = package
+        self.executable = executable
+
+
 def install_packages(packages):
     """Install component(s) using the system installer."""
     num_installed = 0
@@ -302,7 +318,7 @@ def install_packages(packages):
                 error('Please install these packages before trying again:',
                       packages, fatal_error=True)
             info('Installing packages:', to_install)
-            if not options.DRYRUN:
+            if not DRYRUN:
                 if subprocess.run(INSTALL_COMMAND + to_install).returncode != 0:
                     error('Package installation failed.', fatal_error=True)
             num_installed += len(to_install)
@@ -311,7 +327,7 @@ def install_packages(packages):
 
 def delete_file(*paths, fatal_error=False, always_run=False):
     """Delete one or more files."""
-    dry_run = options.DRYRUN and not always_run
+    dry_run = DRYRUN and not always_run
     for path in paths:
         if os.path.exists(path):
             info2('Delete file:', [path])
@@ -430,22 +446,23 @@ def display_table(row_seq,
         info(row_formatter.output_item())
 
 
-def create_directory(path):
+def create_directory(*path_segments):
     """Create a directory, including missing parent directories, as needed."""
+    path = os.path.expanduser(os.path.join(*path_segments))
     if os.path.isdir(path):
         return False
     if os.path.exists(path):
         error('Path exists, but is not a directory:', [path], fatal_error=True)
-    if options.DRYRUN:
+    if DRYRUN:
         if path in DRYRUN_DIRECTORIES_CREATED:
             return False
         DRYRUN_DIRECTORIES_CREATED.add(path)
     info('Create directory:', [path])
-    if options.DRYRUN:
-        return True
+    if DRYRUN:
+        return path
     try:
         os.makedirs(path)
-        return True
+        return path
     except OSError as exc:
         error('Error creating directory:', [path, exc], fatal_error=True)
 
@@ -478,7 +495,7 @@ def open_output_file(path, binary=False, mkdir=False, permissions=None):
     """Open a file for writing."""
     if mkdir:
         create_directory(os.path.dirname(path))
-    if options.DRYRUN:
+    if DRYRUN:
         class FakeOutputFile:
             def write(self, data):
                 pass
@@ -510,12 +527,12 @@ def open_output_file(path, binary=False, mkdir=False, permissions=None):
 def download_url(url, timeout=60, fatal_error=False):
     try:
         request = urllib.request.Request(url)
-        request.add_header('User-Agent', constants.FORWARDING_REQUEST_USER_AGENT_STRING)
-        if options.VERBOSE:
+        request.add_header('User-Agent', FORWARDING_REQUEST_USER_AGENT_STRING)
+        if VERBOSE:
             info2('Download URL: "{}"'.format(request.get_full_url()))
         with urllib.request.urlopen(request, timeout=timeout) as response:
             response_data = response.read()
-            if options.VERBOSE:
+            if VERBOSE:
                 info2('Download data:', [str(response_data)])
             return response_data
     except urllib.request.URLError as exc:
@@ -532,7 +549,7 @@ def download_file(url, path, expiration=None, force=False, fatal_error=False):
         if not force and (not expiration or (time.time() - os.path.getctime(path) <= expiration)):
             info2('Use existing file for download URL:', [url, path])
             do_download = False
-    if do_download and not options.DRYRUN:
+    if do_download and not DRYRUN:
         info('Download:', ['From: {}'.format(url), '  To: {}'.format(path)])
         download_data = download_url(url, fatal_error=fatal_error)
         if download_data:
@@ -561,7 +578,7 @@ def download_json(url, timeout=60, fatal_error=False):
 def unzip_to(zip_path, directory):
     """Extract files from a zip file to a target directory."""
     info('Extract zip:', ['From: {}'.format(zip_path), '  To: {}/'.format(directory)])
-    if not options.DRYRUN:
+    if not DRYRUN:
         try:
             with zipfile.ZipFile(zip_path) as zip_file:
                 zip_file.extractall(path=directory)
@@ -569,12 +586,12 @@ def unzip_to(zip_path, directory):
             error('Zip file extraction failed:', [exc], fatal_error=True)
 
 
-def get_running_pid(pid=None, pid_file=None):
+def get_running_pid(pid=None, pid_path=None):
     """Return PID if process identified by PID or pid file path is running."""
-    if not pid and pid_file:
-        if os.path.exists(pid_file):
-            with open_input_file(pid_file, delete_on_error=True) as pid_file:
-                pid = int(pid_file.read())
+    if not pid and pid_path:
+        if os.path.exists(pid_path):
+            with open_input_file(pid_path, delete_on_error=True) as pid_path:
+                pid = int(pid_path.read())
     if pid:
         proc = capture_command('sudo', 'kill', '-0', pid,
                                fatal_error=False,
@@ -594,7 +611,7 @@ def test_server_latency(address, fatal_error=False):
     if proc.returncode != 0:
         if fatal_error:
             error('Unable to ping address:', [address], fatal_error=True)
-        return constants.BIG_NUMBER
+        return 99999999
     lines = proc.stdout.split(os.linesep)
     for line in lines:
         if line.startswith('rtt '):
@@ -604,7 +621,7 @@ def test_server_latency(address, fatal_error=False):
                 break
     if fatal_error:
         error('Failed to parse ping output.', lines, fatal_error=True)
-    return constants.BIG_NUMBER
+    return 99999999
 
 
 class PersistentJSONData:
@@ -637,11 +654,25 @@ class PersistentJSONData:
         if self._dirty:
             info('Saving state:', [self.path])
             create_directory(os.path.dirname(self.path))
-            if not options.DRYRUN:
+            if not DRYRUN:
                 with open_output_file(self.path) as output_file:
                     output_file.write(json.dumps(self.data, indent=2))
                     output_file.write(os.linesep)
         self._dirty = False
+
+
+class Dumpable:
+    """Dumpable overrides __str__ and __repr__ for useful stringized output."""
+    def __str__(self):
+        attr_pairs = []
+        for name, member in inspect.getmembers(self):
+            if not name.startswith('_'):
+                value_string = "'{}'".format(member) if isinstance(member, str) else str(member)
+                attr_pairs.append((name, value_string))
+        attrs_string = ', '.join(['{}={}'.format(key, value) for key, value in attr_pairs])
+        return '{}({})'.format(self.__class__.__name__, attrs_string)
+    def __repr__(self):
+        return str(self)
 
 
 ### Globals

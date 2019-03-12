@@ -1,8 +1,9 @@
 """Configuration meta-data and support functions."""
 
 import os
+import re
+from configparser import ConfigParser
 
-from . import constants
 from . import tools
 
 
@@ -86,11 +87,45 @@ class Meta:
         return option_data
 
 
-def generate_configuration():
-    """Generate a new configuration file."""
-    tools.info('Generating user configuration:', [constants.CONFIGURATION_PATH])
-    with tools.open_output_file(constants.CONFIGURATION_PATH) as config_file:
-        config_file.write('''\
+class ServerOptionSet(tools.Dumpable):
+    """A user-specified server configuration."""
+    def __init__(self, servers, option_data):
+        self.servers = servers
+        for key, value in option_data.items():
+            setattr(self, key, value)
+
+
+class Data:
+    """User configuration data."""
+
+    def __init__(self, path, openvpn_servers):
+        self.path = path
+        self.openvpn_servers = openvpn_servers
+        self._clear()
+
+    def _clear(self):
+        self.raw_option_sets = {}
+        self.default_config = None
+
+    def load(self):
+        """Read and parse the user configuration file."""
+        self._clear()
+        user_config = ConfigParser()
+        with tools.open_input_file(self.path) as config_file:
+            user_config.read_file(config_file)
+            for section in user_config.sections():
+                if self.default_config is None:
+                    self.default_config = section
+                self.raw_option_sets[section] = user_config[section]
+        if not self.raw_option_sets or not self.default_config:
+            tools.error('No option sets found in file:', [self.path], fatal_error=True)
+
+    def generate(self):
+        """Generate a new configuration file."""
+        self._clear()
+        tools.info('Generating user configuration:', [self.path])
+        with tools.open_output_file(self.path) as config_file:
+            config_file.write('''\
 # The DEFAULT section has the data for unspecified options. Any of
 # the options can be overridden in named configuration sections.
 [DEFAULT]
@@ -116,4 +151,30 @@ servers =
 #servers = CA *, France
 #port_forwarding = yes
 #discipline = rotation
-    ''')
+''')
+
+    def get_server(self, name=None):
+        """Return named or default configuration option set."""
+        name = name or self.default_config
+        if name not in self.raw_option_sets:
+            tools.error('Option set not found: {}'.format(name), fatal_error=True)
+        raw_option_set = self.raw_option_sets[name]
+        servers_string = raw_option_set.get('servers', None)
+        if servers_string:
+            server_patterns = [pat.strip() for pat in servers_string.split(',')]
+        else:
+            server_patterns = []
+        matched_server_names = set()
+        matching_openvpn_servers = []
+        for pattern in server_patterns:
+            regex_pattern = r'^{}$'.format(pattern.replace('*', '.*'))
+            server_matcher = re.compile(regex_pattern, re.IGNORECASE)
+            for openvpn_server in self.openvpn_servers:
+                if server_matcher.match(openvpn_server.name):
+                    if openvpn_server.name not in matched_server_names:
+                        matched_server_names.add(openvpn_server.name)
+                        matching_openvpn_servers.append(openvpn_server)
+        if not matching_openvpn_servers:
+            tools.warning('No matching servers for pattern.')
+        option_data = Meta.check_data(raw_option_set)
+        return ServerOptionSet(matching_openvpn_servers, option_data)
