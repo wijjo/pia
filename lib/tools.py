@@ -266,7 +266,8 @@ def heading(*line_objs):
 def run_command(*args, **kwargs):
     """Simplified interface to subprocess.run() for non-shell command."""
     fatal_error = kwargs.pop('fatal_error', False)
-    dry_run = DRYRUN and not kwargs.pop('always_run', False)
+    always_run = kwargs.pop('always_run', False)
+    dry_run = DRYRUN and not always_run
     # String-ize the positional arguments
     subprocess_args = [str(arg) for arg in args]
     # May be called before TOOLS is set up.

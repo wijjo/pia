@@ -1,10 +1,15 @@
 """Command line sub-command handling."""
 
 import sys
+import os
 import argparse
-import inspect
+import glob
+import importlib.util
 
 from . import tools
+
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+COMMANDS_DIR = os.path.join(BASE_DIR, 'commands.d')
 
 class Argument(object):
     """Positional/keyword arguments for ArgumentParser.add_argument()."""
@@ -107,20 +112,37 @@ def process_commands(sub_command_classes, description):
         tools.DRYRUN = parsed_args.DRYRUN
     sub_command_class = sub_command_classes[parsed_args.COMMAND]
     sub_command = sub_command_class(argument_parser, sub_command_argument_parsers)
-    sub_command.invoke_run()
+    sub_command.invoke_run(parsed_args)
 
 
 def find_command_classes(commands, module):
     """Populate a command dictionary for a module."""
-    for _name, obj in inspect.getmembers(module):
-        if inspect.isclass(obj) and issubclass(obj, SubCommand):
-            if hasattr(obj, 'name'):
-                commands[obj.name] = obj
+    commands['help'] = Help
+    for module_path in sorted(glob.glob(os.path.join(COMMANDS_DIR, '*.py'))):
+        module_name = 'COMMAND_{}'.format(os.path.splitext(os.path.basename(module_path))[0])
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        class SubCommandModule(SubCommand):
+            name = getattr(module, 'name', module.__name__)
+            help = getattr(module, 'help', '(help unavailable)')
+            arguments = getattr(module, 'arguments', [])
+            def setup(self):
+                if hasattr(module, 'setup'):
+                    module.setup(self.options)      #pylint: disable=no-member
+            def execute(self):
+                if hasattr(module, 'execute'):
+                    module.execute(self.options)    #pylint: disable=no-member
+                else:
+                    raise NotImplementedError
+            def cleanup(self):
+                if hasattr(module, 'setup'):
+                    module.cleanup(self.options)    #pylint: disable=no-member
+        commands[SubCommandModule.name] = SubCommandModule
 
 
 def main(description):
     """Main function."""
-    # Find all the sub-command subclasses in this module.
     sub_command_classes = {}
     find_command_classes(sub_command_classes, sys.modules[__name__])
     process_commands(sub_command_classes, description)
