@@ -31,7 +31,7 @@ class Credentials:
                 sys.exit(1)
             with tools.open_output_file(self.path,
                                         permissions='600',
-                                        mkdir=True) as credentials_file:
+                                        create_directory=True) as credentials_file:
                 credentials_file.write_lines(username, password)
         tools.info('Credentials were saved:', [self.path])
 

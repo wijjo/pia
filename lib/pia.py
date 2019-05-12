@@ -10,6 +10,7 @@ from html.parser import HTMLParser
 
 from . import tools
 from . import openvpn
+from . import provider
 
 # Various PIA URLs
 BASE_DIRECTORY = os.path.expanduser('~/.pia')
@@ -197,7 +198,7 @@ class PIAProvider:
                 client_id = id_file.read().strip()
         else:
             client_id = hashlib.sha256(os.urandom(16384)).hexdigest()
-            with tools.open_output_file(self.client_id_path, mkdir=True) as id_file:
+            with tools.open_output_file(self.client_id_path, create_directory=True) as id_file:
                 id_file.write(client_id)
         full_url = '/'.join([FORWARDING_REQUEST_URL, '?client_id={}'.format(client_id)])
         json_response = tools.download_json(full_url, timeout=4)
@@ -225,17 +226,16 @@ class PIAProvider:
                 self.config_dir,
             )
 
-    def get_servers(self):
+    def get_servers(self, recent_server_names):
         """Get VPN servers."""
-        recent = self.saved_state.data.recent_servers or [] #pylint: disable=E1101
         servers = {}
         for openvpn_protocol_bundle in self.iterate_openvpn_bundles():
             for server in openvpn_protocol_bundle.servers:
                 if server.name not in servers:
-                    if server.name in recent:
-                        recent_order = recent.index(server.name) + 1
+                    if server.name in recent_server_names:
+                        recent_order = recent_server_names.index(server.name) + 1
                     else:
-                        recent_order = len(recent) + 1
+                        recent_order = len(recent_server_names) + 1
                     servers[server.name] = openvpn.Server(
                         server.name,
                         server.path,

@@ -43,7 +43,7 @@ class SubCommand(object):
                 self.execute()  #pylint: disable=E1101
             if hasattr(self, 'cleanup'):
                 self.cleanup()  #pylint: disable=E1101
-        except BaseException as exc:
+        except tools.BaseException as exc:
             tools.error(exc, fatal_error=True)
 
 
@@ -121,24 +121,25 @@ def find_command_classes(commands, module):
     for module_path in sorted(glob.glob(os.path.join(COMMANDS_DIR, '*.py'))):
         module_name = 'COMMAND_{}'.format(os.path.splitext(os.path.basename(module_path))[0])
         spec = importlib.util.spec_from_file_location(module_name, module_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        class SubCommandModule(SubCommand):
-            name = getattr(module, 'name', module.__name__)
-            help = getattr(module, 'help', '(help unavailable)')
-            arguments = getattr(module, 'arguments', [])
+        imported_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(imported_module)
+        class CommandModuleWrapper(SubCommand):
+            module = imported_module
+            name = getattr(imported_module, 'name', imported_module.__name__)
+            help = getattr(imported_module, 'help', '(help unavailable)')
+            arguments = getattr(imported_module, 'arguments', [])
             def setup(self):
-                if hasattr(module, 'setup'):
-                    module.setup(self.options)      #pylint: disable=no-member
+                if hasattr(self.module, 'setup'):
+                    self.module.setup(self.options)     #pylint: disable=no-member
             def execute(self):
-                if hasattr(module, 'execute'):
-                    module.execute(self.options)    #pylint: disable=no-member
+                if hasattr(self.module, 'execute'):
+                    self.module.execute(self.options)   #pylint: disable=no-member
                 else:
                     raise NotImplementedError
             def cleanup(self):
-                if hasattr(module, 'setup'):
-                    module.cleanup(self.options)    #pylint: disable=no-member
-        commands[SubCommandModule.name] = SubCommandModule
+                if hasattr(self.module, 'setup'):
+                    self.module.cleanup(self.options)   #pylint: disable=no-member
+        commands[CommandModuleWrapper.name] = CommandModuleWrapper
 
 
 def main(description):

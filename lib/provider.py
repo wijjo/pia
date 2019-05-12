@@ -7,12 +7,25 @@ import collections
 from . import tools
 from . import configuration
 from . import credentials
-from . import pia
 from . import firewall
 
 Paths = collections.namedtuple('Server', [
     'config_dir', 'state_dir', 'download_dir', 'port_path'
 ])
+
+
+PROVIDER_CLASS = None
+
+
+def set_provider_class(provider_class):
+    """
+    Establish the VPN provider class.
+
+    IMPORTANT: This must have been called with a VPN provider class before
+    attempting to create a provider Tool.
+    """
+    global PROVIDER_CLASS
+    PROVIDER_CLASS = provider_class
 
 
 class Tool:
@@ -24,19 +37,19 @@ class Tool:
     vpn_config_protocol_regex = re.compile(r'^\s*proto (\w+)\s*$')
 
     def __init__(self):
-        #TODO: Support other non-PIA providers.
-        provider_cls = pia.PIAProvider
-        self.base_dir = tools.create_directory('~', '.{}'.format(provider_cls.short_name))
-        self.config_dir = tools.create_directory(self.base_dir, 'configuration')
-        self.state_dir = tools.create_directory(self.base_dir, 'state')
-        self.download_dir = tools.create_directory(self.base_dir, 'downloads')
-        self.config_path = os.path.join(self.config_dir, '{}.conf'.format(provider_cls.short_name))
-        self.cred_path = os.path.join(self.config_dir, '{}.cred'.format(provider_cls.short_name))
-        self.port_path = os.path.join(self.state_dir, '{}.port'.format(provider_cls.short_name))
-        self.state_path = os.path.join(self.state_dir, '{}.state.json'.format(provider_cls.short_name))
-        self.pid_path = os.path.join(self.state_dir, '{}.pid'.format(provider_cls.short_name))
-        self.log_path = os.path.join(self.state_dir, '{}.log'.format(provider_cls.short_name))
-        self.provider = provider_cls(Paths(
+        if not PROVIDER_CLASS:
+            tools.error('No VPN provider class was configured by application.', fatal_error=True)
+        self.base_dir = tools.get_directory('~', '.{}'.format(PROVIDER_CLASS.short_name)).path
+        self.config_dir = tools.get_directory(self.base_dir, 'configuration').path
+        self.state_dir = tools.get_directory(self.base_dir, 'state').path
+        self.download_dir = tools.get_directory(self.base_dir, 'downloads').path
+        self.config_path = os.path.join(self.config_dir, '{}.conf'.format(PROVIDER_CLASS.short_name))
+        self.cred_path = os.path.join(self.config_dir, '{}.cred'.format(PROVIDER_CLASS.short_name))
+        self.port_path = os.path.join(self.state_dir, '{}.port'.format(PROVIDER_CLASS.short_name))
+        self.state_path = os.path.join(self.state_dir, '{}.state.json'.format(PROVIDER_CLASS.short_name))
+        self.pid_path = os.path.join(self.state_dir, '{}.pid'.format(PROVIDER_CLASS.short_name))
+        self.log_path = os.path.join(self.state_dir, '{}.log'.format(PROVIDER_CLASS.short_name))
+        self.provider = PROVIDER_CLASS(Paths(
             self.config_dir,
             self.state_dir,
             self.download_dir,
@@ -53,13 +66,14 @@ class Tool:
     def openvpn_servers(self):
         """Provide and manage cached OpenVPN server list."""
         if not hasattr(self, '_openvpn_servers'):
-            self._openvpn_servers = self.provider.get_servers()
+            recent_server_names = self.saved_state.data.recent_servers or []     #pylint: disable=E1101
+            self._openvpn_servers = self.provider.get_servers(recent_server_names)
         return self._openvpn_servers
 
     @property
     def config(self):
         """On-demand access to user configuration data."""
-        if not hasattr('_config'):
+        if not hasattr(self, '_config'):
             self._config = configuration.Data(self.config_path, self.openvpn_servers)
             self._config.load()
         return self._config
@@ -67,7 +81,7 @@ class Tool:
     @property
     def credentials(self):
         """On-demand access to user credentials."""
-        if not hasattr('_credentials'):
+        if not hasattr(self, '_credentials'):
             self._credentials = credentials.Credentials(self.cred_path)
         return self._credentials
 

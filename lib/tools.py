@@ -107,6 +107,9 @@ class DisplayItem:
             for child_item in self.children:
                 if isinstance(child_item, DisplayItem):
                     parts.append(child_item.to_string(attribute_map=attribute_map))
+                elif isinstance(child_item, Exception):
+                    parts.append('Exception[{}]: '.format(child_item.__class__.__name__))
+                    parts.append(''.join(str(child_item)))
                 else:
                     parts.append(str(child_item))
         if attribute_map and self.attributes and 'reset' in attribute_map:
@@ -447,25 +450,44 @@ def display_table(row_seq,
         info(row_formatter.output_item())
 
 
-def create_directory(*path_segments):
-    """Create a directory, including missing parent directories, as needed."""
-    path = os.path.expanduser(os.path.join(*path_segments))
-    if os.path.isdir(path):
-        return False
-    if os.path.exists(path):
-        error('Path exists, but is not a directory:', [path], fatal_error=True)
-    if DRYRUN:
-        if path in DRYRUN_DIRECTORIES_CREATED:
-            return False
-        DRYRUN_DIRECTORIES_CREATED.add(path)
-    info('Create directory:', [path])
-    if DRYRUN:
-        return path
-    try:
-        os.makedirs(path)
-        return path
-    except OSError as exc:
-        error('Error creating directory:', [path, exc], fatal_error=True)
+def get_directory(*path_segments, create_directory=True, fatal_error=True):
+    """
+    Get a directory, optionally creating it.
+
+    By default it creates a missing directory and makes all errors fatal.
+
+    Check the "exists" status member fatal_error is False.
+
+    Return an object with these members:
+        path        absolute directory path or None if unavailable
+        created     True if it was created by this call
+        exists      True if the directory exists
+    """
+    class DirectoryStatus:
+        def __init__(self):
+            self.path = os.path.expanduser(os.path.join(*path_segments))
+            self.created = False
+            self.exists = (
+                os.path.isdir(self.path) or
+                (DRYRUN and status.path in DRYRUN_DIRECTORIES_CREATED))
+    status = DirectoryStatus()
+    if not status.exists:
+        # It may not exist as a directory, but it could be something else.
+        if os.path.exists(status.path):
+            error('Path exists, but is not a directory:', [status.path],
+                  fatal_error=fatal_error)
+        if create_directory:
+            info('Create directory:', [status.path])
+            if DRYRUN:
+                DRYRUN_DIRECTORIES_CREATED.add(status.path)
+            else:
+                try:
+                    os.makedirs(status.path)
+                    status.exists = True
+                except OSError as exc:
+                    error('Error creating directory:', [status.path, exc],
+                          fatal_error=fatal_error)
+    return status
 
 
 @contextmanager
@@ -492,10 +514,10 @@ def open_input_file(path, binary=False, delete_on_error=False):
 
 
 @contextmanager
-def open_output_file(path, binary=False, mkdir=False, permissions=None):
+def open_output_file(path, binary=False, create_directory=False, permissions=None):
     """Open a file for writing."""
-    if mkdir:
-        create_directory(os.path.dirname(path))
+    # Errors are fatal -- return status can be ignored.
+    get_directory(os.path.dirname(path), create_directory=create_directory)
     if DRYRUN:
         class FakeOutputFile:
             def write(self, data):
@@ -541,10 +563,14 @@ def download_url(url, timeout=60, fatal_error=False):
     except Exception as exc:
         error('Download failed due to other error:', [url, exc], fatal_error=fatal_error)
 
-
-def download_file(url, path, expiration=None, force=False, fatal_error=False):
+def download_file(url,
+                  path,
+                  expiration=None,
+                  force=False,
+                  create_directory=True,
+                  fatal_error=False):
     """Download a file if it hasn't been downloaded recently."""
-    create_directory(os.path.dirname(path))
+    # Errors are fatal -- return status can be ignored.
     do_download = True
     if os.path.exists(path):
         if not force and (not expiration or (time.time() - os.path.getctime(path) <= expiration)):
@@ -554,7 +580,8 @@ def download_file(url, path, expiration=None, force=False, fatal_error=False):
         info('Download:', ['From: {}'.format(url), '  To: {}'.format(path)])
         download_data = download_url(url, fatal_error=fatal_error)
         if download_data:
-            with open_output_file(path, binary=True, mkdir=True) as downloaded_file:
+            with open_output_file(
+                    path, binary=True, create_directory=create_directory) as downloaded_file:
                 downloaded_file.write(download_data)
     return do_download
 
