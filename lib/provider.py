@@ -3,6 +3,7 @@
 import os
 import re
 import collections
+import time
 
 from . import tools
 from . import configuration
@@ -15,6 +16,10 @@ Paths = collections.namedtuple('Server', [
 
 
 PROVIDER_CLASS = None
+
+
+DEVICE_WAIT_SLEEP_SECONDS = 0
+DEVICE_WAIT_MAX_RETRIES = 5
 
 
 def set_provider_class(provider_class):
@@ -38,7 +43,7 @@ class Tool:
 
     def __init__(self):
         if not PROVIDER_CLASS:
-            tools.error('No VPN provider class was configured by application.', fatal_error=True)
+            tools.error('No VPN provider class was configured.', fatal_error=True)
         self.base_dir = tools.get_directory('~', '.{}'.format(PROVIDER_CLASS.short_name)).path
         self.config_dir = tools.get_directory(self.base_dir, 'configuration').path
         self.state_dir = tools.get_directory(self.base_dir, 'state').path
@@ -129,15 +134,28 @@ class Tool:
                 data.def_dev = matched.group(2)
                 break
         else:
-            tools.error('Failed to find default device using "ip route show".', fatal_error=True)
-        proc = tools.capture_command('sudo', 'cat', self.log_path, always_run=True)
-        for line in proc.stdout.split(os.linesep):
-            matched = self.vpn_device_regex.search(line)
-            if matched:
-                data.vpn_dev = matched.group(1)
-                break
-        else:
-            tools.error('Failed to find TUN/TAP device in log.', fatal_error=True)
+            tools.error('Failed to find default device using "ip route show".',
+                        fatal_error=True)
+        for retry_num in range(DEVICE_WAIT_MAX_RETRIES + 1):
+            if retry_num > 0:
+                tools.info('Waiting for TUN/TAP device -- retry {} of {}'.format(
+                           retry_num, DEVICE_WAIT_MAX_RETRIES))
+            time.sleep(DEVICE_WAIT_SLEEP_SECONDS)
+            proc = tools.capture_command('sudo', 'cat', self.log_path, always_run=True)
+            for line in proc.stdout.split(os.linesep):
+                matched = self.vpn_device_regex.search(line)
+                if matched:
+                    data.vpn_dev = matched.group(1)
+                    tools.info('Found TUN/TAP devicd: {}'.format(data.vpn_dev))
+                    break
+            else:
+                continue
+            break
+        if not data.vpn_dev and tools.DRYRUN:
+            data.vpn_dev = '(dryrun-tun-device)'
+        if not data.vpn_dev:
+            tools.error('Failed to find TUN/TAP device in log: {}'.format(self.log_path),
+                        fatal_error=True)
         with tools.open_input_file(vpn_config_path) as vpn_config_file:
             for line in vpn_config_file:
                 matched = self.vpn_config_remote_regex.match(line)
@@ -152,21 +170,22 @@ class Tool:
     def start_firewall(self, config_path,
                        port_forwarding=False,
                        block_lan=False,
-                       disable_firewall=False):
+                       new_port=False):
         """Start the VPN-tweaked firewall."""
-        if not disable_firewall:
-            vpn = self.get_vpn_data(config_path)
-            tools.info('Resetting the firewall ...')
-            firewall.reset()
-            tools.info('Starting the firewall ...')
-            firewall.start(vpn.def_dev, vpn.vpn_dev, vpn.lan_addr, vpn.port, vpn.protocol)
-            if port_forwarding:
-                new_string = ' (new)' if self.options.NEW_PORT else ''
-                tools.info('Determining{} forwarded port ...'.format(new_string))
-                forwarded_port = self.provider.get_forwarded_port(new_port=self.options.NEW_PORT)
-                tools.info('Forwarding port {}...'.format(forwarded_port))
-                firewall.forward_port(vpn.vpn_dev, forwarded_port)
-            if not block_lan:
-                tools.info('Enabling LAN address {} on {} ...'.format(vpn.def_dev, vpn.lan_addr))
-                firewall.enable_lan(vpn.def_dev, vpn.lan_addr)
-            tools.info('Firewall enabled.')
+        vpn = self.get_vpn_data(config_path)
+        tools.info('Resetting the firewall ...')
+        firewall.reset()
+        tools.info('Starting the firewall ...')
+        sshd_port = tools.get_sshd_port()
+        tools.info('SSHD port is {}.'.format(sshd_port))
+        firewall.start(vpn.def_dev, vpn.vpn_dev, vpn.lan_addr, vpn.port, vpn.protocol, sshd_port)
+        if port_forwarding:
+            new_string = ' (new)' if new_port else ''
+            tools.info('Determining{} forwarded port ...'.format(new_string))
+            forwarded_port = self.provider.get_forwarded_port(new_port=new_port)
+            tools.info('Forwarding port {}...'.format(forwarded_port))
+            firewall.forward_port(vpn.vpn_dev, forwarded_port)
+        if not block_lan:
+            tools.info('Enabling LAN address {} on {} ...'.format(vpn.def_dev, vpn.lan_addr))
+            firewall.enable_lan(vpn.def_dev, vpn.lan_addr)
+        tools.info('Firewall enabled.')

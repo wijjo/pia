@@ -2,9 +2,10 @@
 
 import sys
 import os
+import re
 import subprocess
 import math
-import urllib
+from urllib.request import Request, urlopen, URLError
 import time
 import json
 import zipfile
@@ -19,6 +20,8 @@ FORWARDING_REQUEST_USER_AGENT_STRING = ' '.join([
     'AppleWebKit/537.36 (KHTML, like Gecko)',
     'Chrome/39.0.2171.95 Safari/537.36',
 ])
+SSHD_CONFIG_PATH = '/etc/ssh/sshd_config'
+SSHD_CONFIG_PORT_REGEX = re.compile(r'^\s*Port\s+(\d+)\s*(?:#.*)?$')
 DRYRUN = False
 VERBOSE = False
 
@@ -116,6 +119,14 @@ class DisplayItem:
             parts.append(attribute_map['reset'])
         return ''.join(parts)
 
+    @classmethod
+    def any_to_string(cls, item, attribute_map=None):
+        """Convert DisplayItem or other type to string."""
+        if isinstance(item, cls):
+            return item.to_string(attribute_map=attribute_map)
+        else:
+            return str(item)
+
     def text_length(self):
         """Return the total text length."""
         length = 0
@@ -128,38 +139,51 @@ class DisplayItem:
         return length
 
 
+class ConsoleStream:
+    def __init__(self,
+                 attribute_map,
+                 output_stream=None,
+                 prepend=None,
+                 append=None,
+                 attributes=None):
+        self.attribute_map = attribute_map
+        self.attributes = list(iterate_items(attributes))
+        self.output_stream = output_stream or sys.stdout
+        self.prepend = prepend
+        self.append = append
+    def stream_output(self, *line_objs, indent=0):
+        for line_obj in line_objs:
+            if isinstance(line_obj, (list, tuple)):
+                self.stream_output(*line_obj, indent=(indent + 1))
+            else:
+                items = []
+                if self.prepend:
+                    items.extend(iterate_items(self.prepend))
+                if indent > 0:
+                    items.append('  ' * indent)
+                items.append(line_obj)
+                if self.append:
+                    items.extend(iterate_items(self.append))
+                outer_item = DisplayItem(*items, attributes=self.attributes)
+                self.output_stream.write(outer_item.to_string(attribute_map=self.attribute_map))
+                self.output_stream.write(os.linesep)
+    def __call__(self, *line_objs, indent=0):
+        self.stream_output(*line_objs)
+
+
 class ConsoleStreamMaker:
     """Make streams for console output."""
 
     def __init__(self, attribute_map):
         self.attribute_map = attribute_map
 
-    def create_stream(self, for_errors=False, prepend=None, append=None, attributes=None):
+    def create_stream(self, output_stream=False, prepend=None, append=None, attributes=None):
         """Create message output stream."""
-        class Stream:
-            def __init__(self, attribute_map):
-                self.attribute_map = attribute_map
-                self.attributes = list(iterate_items(attributes))
-                self.output_stream = sys.stderr if for_errors else sys.stdout
-            def stream_output(self, *line_objs, indent=0):
-                for line_obj in line_objs:
-                    if isinstance(line_obj, (list, tuple)):
-                        self.stream_output(*line_obj, indent=(indent + 1))
-                    else:
-                        items = []
-                        if prepend:
-                            items.extend(iterate_items(prepend))
-                        if indent > 0:
-                            items.append('  ' * indent)
-                        items.append(line_obj)
-                        if append:
-                            items.extend(iterate_items(append))
-                        outer_item = DisplayItem(*items, attributes=self.attributes)
-                        self.output_stream.write(outer_item.to_string(attribute_map=self.attribute_map))
-                        self.output_stream.write(os.linesep)
-            def __call__(self, *line_objs, indent=0):
-                self.stream_output(*line_objs)
-        return Stream(self.attribute_map)
+        return ConsoleStream(self.attribute_map,
+                             output_stream=output_stream,
+                             prepend=prepend,
+                             append=append,
+                             attributes=attributes)
 
 
 def find_file_in_path(file_name, search_path, executable=False):
@@ -229,9 +253,10 @@ class BaseException(Exception):
         super().__init__(os.linesep.join(self.messages))
 
 
-def shorten_path(path):
+def shorten_path(*path_parts):
     """Shorten a path for display."""
     # For now just convert $HOME to '~'.
+    path = os.path.join(*path_parts)
     if path.startswith(os.environ['HOME']):
         return os.path.join('~', path[len(os.environ['HOME']) + 1:])
     return path
@@ -372,11 +397,14 @@ class RowFormatter:
         self.data = data
         self.attr = attr
 
-    def output_item(self):
+    def format_item(self, attribute_map=None):
         num_row_cols = len(self.data)
         if num_row_cols < self.col_count:
             self.data.extend([''] * (self.col_count - num_row_cols))
-        data_str = self.row_format % tuple([str(item) for item in self.data])
+        data_str = self.row_format % tuple([
+            DisplayItem.any_to_string(item, attribute_map=attribute_map)
+            for item in self.data
+        ])
         return DisplayItem(data_str, attributes=self.attr)
 
     @classmethod
@@ -435,7 +463,7 @@ def display_table(row_seq,
         pad_width_right = total_width - pad_width_left - len(title_string) - 2
         pad_left = '=' * max(pad_width_left, 3)
         pad_right = '=' * max(pad_width_right, 3)
-        info(DisplayItem(pad_left, ' ', title_string, ' ', pad_right, attributes='magenta'))
+        PLAIN_STREAM(DisplayItem(pad_left, ' ', title_string, ' ', pad_right, attributes='magenta'))
     if header:
         row_formatters.insert(0, RowFormatter([
             header[i].center(widths[i]).rstrip()
@@ -447,7 +475,7 @@ def display_table(row_seq,
         return
     RowFormatter.update(widths, column_types)
     for row_formatter in row_formatters:
-        info(row_formatter.output_item())
+        PLAIN_STREAM(row_formatter.format_item(attribute_map=PLAIN_STREAM.attribute_map))
 
 
 def get_directory(*path_segments, create_directory=True, fatal_error=True):
@@ -547,18 +575,20 @@ def open_output_file(path, binary=False, create_directory=False, permissions=Non
                       [path], fatal_error=True)
 
 
-def download_url(url, timeout=60, fatal_error=False):
+def download_url(url, timeout=60, fatal_error=False, encoding='utf-8'):
     try:
-        request = urllib.request.Request(url)
+        request = Request(url)
         request.add_header('User-Agent', FORWARDING_REQUEST_USER_AGENT_STRING)
         if VERBOSE:
             info2('Download URL: "{}"'.format(request.get_full_url()))
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urlopen(request, timeout=timeout) as response:
             response_data = response.read()
+            if encoding:
+                response_data = response_data.decode(encoding)
             if VERBOSE:
                 info2('Download data:', [str(response_data)])
             return response_data
-    except urllib.request.URLError as exc:
+    except URLError as exc:
         error('Download failed due to URL error:', [url, exc], fatal_error=fatal_error)
     except Exception as exc:
         error('Download failed due to other error:', [url, exc], fatal_error=fatal_error)
@@ -568,7 +598,8 @@ def download_file(url,
                   expiration=None,
                   force=False,
                   create_directory=True,
-                  fatal_error=False):
+                  fatal_error=False,
+                  encoding='utf-8'):
     """Download a file if it hasn't been downloaded recently."""
     # Errors are fatal -- return status can be ignored.
     do_download = True
@@ -578,7 +609,7 @@ def download_file(url,
             do_download = False
     if do_download and not DRYRUN:
         info('Download:', ['From: {}'.format(url), '  To: {}'.format(path)])
-        download_data = download_url(url, fatal_error=fatal_error)
+        download_data = download_url(url, fatal_error=fatal_error, encoding=encoding)
         if download_data:
             with open_output_file(
                     path, binary=True, create_directory=create_directory) as downloaded_file:
@@ -586,8 +617,8 @@ def download_file(url,
     return do_download
 
 
-def download_json(url, timeout=60, fatal_error=False):
-    response = download_url(url, timeout=timeout, fatal_error=fatal_error)
+def download_json(url, timeout=60, fatal_error=False, encoding='utf-8'):
+    response = download_url(url, timeout=timeout, fatal_error=fatal_error, encoding=encoding)
     if response:
         try:
             if not isinstance(response, bytes):
@@ -627,6 +658,18 @@ def get_running_pid(pid=None, pid_path=None):
         if proc.returncode != 0:
             pid = None
     return pid
+
+
+def get_sshd_port():
+    """Return the port used for SSH or 22 as a default."""
+    port = 22
+    if os.path.exists(SSHD_CONFIG_PATH):
+        with open_input_file(SSHD_CONFIG_PATH) as sshd_file:
+            for line in sshd_file:
+                matched = SSHD_CONFIG_PORT_REGEX.match(line)
+                if matched:
+                    port = int(matched.group(1))
+    return port
 
 
 def test_server_latency(address, fatal_error=False):
@@ -681,7 +724,7 @@ class PersistentJSONData:
         """Flush the state to disk."""
         if self._dirty:
             info('Saving state:', [self.path])
-            create_directory(os.path.dirname(self.path))
+            _save_dir = get_directory(os.path.dirname(self.path))
             if not DRYRUN:
                 with open_output_file(self.path) as output_file:
                     output_file.write(json.dumps(self.data, indent=2))
@@ -709,12 +752,13 @@ CONSOLE_STREAM_MAKER = ConsoleStreamMaker(get_terminal_attribute_symbols())
 INFO_STREAM = CONSOLE_STREAM_MAKER.create_stream()
 HEADING_STREAM = CONSOLE_STREAM_MAKER.create_stream(attributes='blue')
 WARNING_STREAM = CONSOLE_STREAM_MAKER.create_stream(prepend='WARNING: ',
-                                                    for_errors=True,
+                                                    output_stream=sys.stderr,
                                                     attributes='yellow')
 ERROR_STREAM = CONSOLE_STREAM_MAKER.create_stream(prepend='ERROR: ',
-                                                  for_errors=True,
+                                                  output_stream=sys.stderr,
                                                   attributes='red')
 INFO2_STREAM = CONSOLE_STREAM_MAKER.create_stream(prepend='INFO2: ')
+PLAIN_STREAM = CONSOLE_STREAM_MAKER.create_stream()
 
 if find_executable('pacman', as_superuser=True):
     INSTALL_COMMAND = ['sudo', 'pacman', '--noconfirm', '-S']

@@ -1,5 +1,6 @@
 """Status command."""
 
+import os
 from lib import tools
 from lib import provider
 

@@ -22,6 +22,10 @@ arguments = [
         '-s', '--server-config', dest='SERVER_CONFIG', action='store',
         help='server configuration name to use instead of default'
     ),
+    command.Argument(
+        '--no-firewall', dest='NO_FIREWALL', action='store_true',
+        help='do not configure the firewall'
+    ),
 ]
 
 def execute(options):
@@ -63,12 +67,13 @@ def execute(options):
                     pid = tools.get_running_pid(pid_path=provider_tool.pid_path)
                 if pid:
                     tools.info('OpenVPN daemon is running with PID: {}'.format(pid))
-                    provider_tool.start_firewall(
-                        server.config_path,
-                        port_forwarding=server.port_forwarding,
-                        block_lan=server_config.block_lan,                 #pylint: disable=no-member
-                        disable_firewall=server_config.disable_firewall,   #pylint: disable=no-member
-                    )
+                    if not options.NO_FIREWALL and not server_config.disable_firewall:  #pylint: disable=no-member
+                        provider_tool.start_firewall(
+                            server.config_path,
+                            port_forwarding=server.port_forwarding,
+                            block_lan=server_config.block_lan,  #pylint: disable=no-member
+                            new_port=options.NEW_PORT,
+                        )
                     break
                 tools.error('OpenVPN does not seem to be running.')
     else:
